@@ -27,8 +27,8 @@ It provides:
 Python 3.13 is used by the current development environment.
 
 ```powershell
-git clone https://github.com/ChenDavidyan/Chen_Viewer.git
-cd Chen_Viewer
+git clone https://github.com/ChenDavidyan/ND2_editor_CDK.git
+cd ND2_editor_CDK
 python -m venv venv
 venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
