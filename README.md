@@ -1,6 +1,6 @@
-# Chen Viewer
+# ND2 Editor CDK
 
-Chen Viewer is a desktop microscopy viewer and exporter for Nikon ND2 files. It uses Napari to inspect FOVs and Z ranges, create maximum-intensity projections, crop an XY region of interest, preview channel montages, and export OME-TIFF or JPEG images.
+ND2 Editor CDK is a desktop microscopy viewer and exporter for Nikon ND2 files. It uses Napari to inspect FOVs and Z ranges, create maximum-intensity projections, crop an XY region of interest, preview channel montages, and export OME-TIFF or JPEG images.
 
 ## Recommended launcher
 
