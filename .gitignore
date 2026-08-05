@@ -1,0 +1,35 @@
+# Python environments and caches
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.pyd
+
+# Local editor and agent state
+.agents/
+.codex/
+.vscode/
+.idea/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Microscopy source data and generated images
+*.nd2
+*.tif
+*.tiff
+*.ome.tif
+*.ome.tiff
+*.jpg
+*.jpeg
+*.png
+*_maxproj/
+jpeg_channels/
+jpeg_montage/
+
+# OS files
+.DS_Store
+Thumbs.db
+
