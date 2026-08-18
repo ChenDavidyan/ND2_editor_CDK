@@ -37,6 +37,7 @@ class SaveQueueWidget(QtWidgets.QWidget):
     """Serial background writer with a small, persistent status panel."""
 
     submit_job = QtCore.Signal(int, str, object)
+    activity_changed = QtCore.Signal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -45,6 +46,7 @@ class SaveQueueWidget(QtWidgets.QWidget):
         self._names: dict[int, str] = {}
         self._states: dict[int, str] = {}
         self._shutting_down = False
+        self._last_active = False
 
         self.summary = QtWidgets.QLabel("Save queue: idle")
         self.progress = QtWidgets.QProgressBar()
@@ -140,6 +142,10 @@ class SaveQueueWidget(QtWidgets.QWidget):
         if failed:
             text += f" | {failed} failed"
         self.summary.setText(text)
+        active = bool(queued or saving)
+        if active != self._last_active:
+            self._last_active = active
+            self.activity_changed.emit(active)
 
     @QtCore.Slot()
     def shutdown(self) -> None:

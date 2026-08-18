@@ -1,9 +1,21 @@
-from nd2_editor.napari_app_faster_threaded_savequeue import launch
-
-
 if __name__ == "__main__":
-    import sys
+    import argparse
 
-    if len(sys.argv) < 2:
-        raise SystemExit("Usage: python run_app_faster_threaded_savequeue.py path/to/file.nd2")
-    launch(sys.argv[1])
+    parser = argparse.ArgumentParser(
+        description="Open an ND2 file in ND2 Editor CDK."
+    )
+    parser.add_argument("nd2_path", help="Path to the input ND2 file")
+    parser.add_argument(
+        "-o",
+        "--out-dir",
+        help=(
+            "Parent output destination. The app creates an <ND2 "
+            "filename>_maxproj folder inside it. Defaults to the input "
+            "file's parent folder."
+        ),
+    )
+    args = parser.parse_args()
+
+    from nd2_editor.napari_app_faster_threaded_savequeue import launch
+
+    launch(args.nd2_path, out_dir=args.out_dir)

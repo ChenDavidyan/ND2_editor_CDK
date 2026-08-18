@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections import OrderedDict
+import hashlib
+import os
 from pathlib import Path
 import math
 
@@ -16,6 +19,7 @@ from PIL import Image, ImageDraw, ImageFont
 from .fov_navigator_threaded import FOVNavigator
 from .save_queue_threaded import SaveQueueWidget
 from .preview_worker_threaded import PreviewController
+from .projection_prefetch_threaded import ProjectionPrefetchController
 from .io_nd2 import (
     max_project_z,
     get_sizes_axes,
@@ -46,6 +50,21 @@ def _save_jpeg_300dpi(path: Path, rgb_u8: np.ndarray, quality: int = 95):
 
 def _get_font(font_size: int) -> ImageFont.ImageFont:
     for name in ("arial.ttf", "Arial.ttf", "DejaVuSans.ttf"):
+        try:
+            return ImageFont.truetype(name, size=int(font_size))
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def _get_marker_font(font_size: int) -> ImageFont.ImageFont:
+    for name in (
+        r"C:\Windows\Fonts\tahomabd.ttf",
+        "tahomabd.ttf",
+        "Tahoma Bold.ttf",
+        "arialbd.ttf",
+        "DejaVuSans-Bold.ttf",
+    ):
         try:
             return ImageFont.truetype(name, size=int(font_size))
         except Exception:
@@ -207,8 +226,10 @@ def _draw_scale_bar_on_rgb(
 
 def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] | None = None):
     nd2_path = Path(nd2_path)
-    out_dir = Path(out_dir) if out_dir else nd2_path.with_suffix("").with_name(nd2_path.stem + "_maxproj")
-    out_dir.mkdir(parents=True, exist_ok=True)
+    output_base_dir = Path(out_dir) if out_dir else nd2_path.parent
+    output_dir = output_base_dir / f"{nd2_path.stem}_maxproj"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_state = {"base_dir": output_base_dir, "dir": output_dir}
 
     f = nd2.ND2File(nd2_path)
     try:
@@ -377,12 +398,46 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
                 app.processEvents(QtCore.QEventLoop.ExcludeUserInputEvents)
         reserved_output_paths: set[Path] = set()
 
-        def _reserve_output_path(path: Path) -> Path:
+        def _path_length_safe_output(path: Path) -> Path:
             path = Path(path)
+            if os.name != "nt" or len(str(path.absolute())) <= 230:
+                return path
+
+            original_name = path.name
+            source_prefix = f"{nd2_path.stem}_"
+            shorter_name = (
+                original_name[len(source_prefix) :]
+                if original_name.startswith(source_prefix)
+                else original_name
+            )
+            candidate = path.with_name(shorter_name)
+            if len(str(candidate.absolute())) <= 230:
+                print(f"[Output] Shortened long filename: {original_name} -> {shorter_name}")
+                return candidate
+
+            compound_suffix = "".join(path.suffixes)
+            name_without_suffix = (
+                shorter_name[: -len(compound_suffix)] if compound_suffix else shorter_name
+            )
+            digest = hashlib.sha1(original_name.encode("utf-8")).hexdigest()[:8]
+            available = 230 - len(str(path.parent.absolute())) - len(compound_suffix) - len(digest) - 2
+            if available < 8:
+                raise OSError(
+                    "The selected output destination is too deeply nested for Windows. "
+                    "Choose a shorter parent destination."
+                )
+            compact_name = f"{name_without_suffix[:available]}_{digest}{compound_suffix}"
+            print(f"[Output] Compacted long filename: {original_name} -> {compact_name}")
+            return path.with_name(compact_name)
+
+        def _reserve_output_path(path: Path) -> Path:
+            path = _path_length_safe_output(Path(path))
             candidate = path
             counter = 2
             while candidate.exists() or candidate in reserved_output_paths:
-                candidate = path.with_name(f"{path.stem}_{counter:03d}{path.suffix}")
+                candidate = _path_length_safe_output(
+                    path.with_name(f"{path.stem}_{counter:03d}{path.suffix}")
+                )
                 counter += 1
             reserved_output_paths.add(candidate)
             return candidate
@@ -409,17 +464,56 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
         # cropping state: applied AFTER projection
         state = {
             "p": 0,
+            "fov_direction": 1,
             "z0": 0,
             "z1": max(0, nZ - 1),
             "last_proj_cyx": None,
             "full_proj_cyx": None,
             "projection_key": None,
+            "prefetch_anchor": None,
             "crop_bbox": None,  # (y0, y1, x0, x1) in pixels
         }
 
         # Full-resolution source planes for the current FOV.  Changing the Z
         # range then becomes an in-memory maximum instead of another ND2 read.
         plane_cache: dict[tuple[int, int], np.ndarray] = {}
+        prefetched_projections: OrderedDict[tuple[int, int, int], np.ndarray] = OrderedDict()
+        prefetch_cache_bytes = 0
+        prefetch_max_entries = 3
+        prefetch_max_bytes = 1536 * 1024 * 1024
+
+        brightfield_raw_indices = [ci.index for ci in ch_infos_disp if ci.is_brightfield]
+        prefetch_controller = ProjectionPrefetchController(
+            nd2_path=nd2_path,
+            axes=axes,
+            sizes=sizes,
+            brightfield_raw_indices=brightfield_raw_indices,
+        )
+        prefetch_status = QtWidgets.QLabel("Prefetch: idle")
+        prefetch_controller.status_changed.connect(prefetch_status.setText)
+        save_queue.activity_changed.connect(prefetch_controller.set_paused)
+
+        def _store_prefetched_projection(p: int, z0: int, z1: int, projection: np.ndarray) -> None:
+            nonlocal prefetch_cache_bytes
+            key = (int(p), min(int(z0), int(z1)), max(int(z0), int(z1)))
+            if key == state["projection_key"]:
+                return
+            old = prefetched_projections.pop(key, None)
+            if old is not None:
+                prefetch_cache_bytes -= old.nbytes
+            prefetched_projections[key] = projection
+            prefetch_cache_bytes += projection.nbytes
+            while len(prefetched_projections) > prefetch_max_entries or (
+                prefetch_cache_bytes > prefetch_max_bytes and len(prefetched_projections) > 1
+            ):
+                _old_key, old_projection = prefetched_projections.popitem(last=False)
+                prefetch_cache_bytes -= old_projection.nbytes
+            print(
+                f"[Prefetch] Cached P={key[0]}, Z={key[1]}:{key[2]} "
+                f"({prefetch_cache_bytes / (1024**2):.1f} MiB total)"
+            )
+
+        prefetch_controller.ready.connect(_store_prefetched_projection)
 
         layer_scale = (float(pixel_um), float(pixel_um)) if pixel_um is not None else None
 
@@ -427,10 +521,24 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
         roi_layer = None
 
         def _get_channel_layers(include_hidden: bool = True):
-            layers = [ly for ly in viewer.layers if ly.__class__.__name__ == "Image" and ly.name.startswith("CH")]
+            layers = [
+                ly
+                for ly in viewer.layers
+                if ly.__class__.__name__ == "Image"
+                and (
+                    bool((getattr(ly, "metadata", {}) or {}).get("nd2_channel_layer", False))
+                    or ly.name.startswith("CH")
+                )
+            ]
             return layers if include_hidden else [ly for ly in layers if ly.visible]
 
         def _layer_display_index(layer) -> int | None:
+            metadata_index = (getattr(layer, "metadata", {}) or {}).get("nd2_display_index")
+            if metadata_index is not None:
+                try:
+                    return int(metadata_index)
+                except (TypeError, ValueError):
+                    pass
             try:
                 return int(layer.name.split("_", 1)[0].replace("CH", ""))
             except Exception:
@@ -438,12 +546,9 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
 
         def _is_brightfield_layer(layer) -> bool:
             di = _layer_display_index(layer)
-            if _looks_brightfield_name(getattr(layer, "name", "")):
-                return True
-            if di is None or di >= len(ch_infos_disp):
-                return False
-            ci = ch_infos_disp[di]
-            return ci.is_brightfield or _looks_brightfield_name(ci.name)
+            if di is not None and di < len(ch_infos_disp):
+                return bool(ch_infos_disp[di].is_brightfield)
+            return _looks_brightfield_name(getattr(layer, "name", ""))
 
         def _visible_fluorescence_layers():
             return [ly for ly in _get_channel_layers(include_hidden=False) if not _is_brightfield_layer(ly)]
@@ -458,20 +563,75 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
             rgb = rgba[..., :3] * float(layer.opacity)
             return (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
 
-        def _make_montage(rgb_images, n_cols=None, pad=8):
+        def _make_montage(
+            rgb_images,
+            n_cols=None,
+            pad=8,
+            labels=None,
+            label_colors=None,
+            label_font_size=64,
+        ):
             h, w, _ = rgb_images[0].shape
             n = len(rgb_images)
             if n_cols is None:
                 n_cols = int(math.ceil(math.sqrt(n)))
             n_rows = int(math.ceil(n / n_cols))
-            H = n_rows * h + (n_rows - 1) * pad
+            base_font_size = max(16, min(200, int(label_font_size)))
+            header_h = 0
+            if labels:
+                probe_font = _get_marker_font(base_font_size)
+                probe = Image.new("RGB", (1, 1))
+                probe_draw = ImageDraw.Draw(probe)
+                probe_bbox = probe_draw.textbbox((0, 0), "Ag", font=probe_font)
+                vertical_padding = max(12, min(36, int(round(base_font_size * 0.35))))
+                header_h = (probe_bbox[3] - probe_bbox[1]) + 2 * vertical_padding
+
+            tile_h = header_h + h
+            H = n_rows * tile_h + (n_rows - 1) * pad
             W = n_cols * w + (n_cols - 1) * pad
             out = np.zeros((H, W, 3), dtype=np.uint8)
             for i, im in enumerate(rgb_images):
                 r, c = divmod(i, n_cols)
-                y0 = r * (h + pad)
+                y0 = r * (tile_h + pad)
                 x0 = c * (w + pad)
-                out[y0 : y0 + h, x0 : x0 + w] = im
+                out[y0 + header_h : y0 + header_h + h, x0 : x0 + w] = im
+
+            if labels:
+                canvas = Image.fromarray(out, mode="RGB")
+                draw = ImageDraw.Draw(canvas)
+                for i, label_value in enumerate(labels):
+                    r, c = divmod(i, n_cols)
+                    y0 = r * (tile_h + pad)
+                    x0 = c * (w + pad)
+                    label = str(label_value)
+                    font_size = base_font_size
+                    while font_size > 20:
+                        font = _get_marker_font(font_size)
+                        bbox = draw.textbbox((0, 0), label, font=font)
+                        if bbox[2] - bbox[0] <= w - 24:
+                            break
+                        font_size -= 2
+                    font = _get_marker_font(font_size)
+                    bbox = draw.textbbox((0, 0), label, font=font)
+                    text_w = bbox[2] - bbox[0]
+                    text_h = bbox[3] - bbox[1]
+                    color = (
+                        tuple(int(v) for v in label_colors[i])
+                        if label_colors is not None
+                        else (255, 255, 255)
+                    )
+                    draw.text(
+                        (
+                            x0 + (w - text_w) // 2,
+                            y0 + (header_h - text_h) // 2 - bbox[1],
+                        ),
+                        label,
+                        fill=color,
+                        font=font,
+                        stroke_width=max(2, min(6, int(round(font_size * 0.07)))),
+                        stroke_fill=(0, 0, 0),
+                    )
+                out = np.asarray(canvas, dtype=np.uint8)
             return out, (n_rows, n_cols)
 
         def _capture_layer_snapshot(layer) -> dict:
@@ -531,6 +691,21 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
 
         def _render_montage_snapshot(snapshots: tuple[dict, ...], settings: dict):
             tiles = [_render_layer_snapshot(snapshot) for snapshot in snapshots]
+            show_labels = bool(settings.get("show_marker_names", True))
+            labels = [snapshot["name"] for snapshot in snapshots] if show_labels else None
+            label_colors = None
+            if show_labels:
+                label_colors = [
+                    (255, 255, 255)
+                    if snapshot["brightfield"]
+                    else tuple(
+                        int(v)
+                        for v in (
+                            np.clip(snapshot["lut"][-1], 0, 1) * 255
+                        ).astype(np.uint8)
+                    )
+                    for snapshot in snapshots
+                ]
             fluorescence = [
                 tile
                 for snapshot, tile in zip(snapshots, tiles)
@@ -541,9 +716,18 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
                 for tile in fluorescence[1:]:
                     merged = np.clip(merged + tile.astype(np.float32) / 255.0, 0, 1)
                 tiles.append((merged * 255).astype(np.uint8))
+                if labels is not None:
+                    labels.append("Merge")
+                    label_colors.append((255, 255, 255))
             if not tiles:
                 raise RuntimeError("No visible channels for montage")
-            montage, layout = _make_montage(tiles, n_cols=len(tiles))
+            montage, layout = _make_montage(
+                tiles,
+                n_cols=len(tiles),
+                labels=labels,
+                label_colors=label_colors,
+                label_font_size=int(settings.get("marker_font_size", 64)),
+            )
             return _burn_scalebar_snapshot(montage, settings), layout
 
         def _merge_visible_fluorescence_excluding_brightfield():
@@ -649,6 +833,30 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
             _repaint_load_progress()
             return projection
 
+        def _schedule_neighbor_prefetch(p: int, z0: int, z1: int) -> None:
+            nonlocal prefetch_cache_bytes
+            zlo, zhi = sorted((int(z0), int(z1)))
+            anchor = (int(p), zlo, zhi, int(state["fov_direction"]))
+            if state["prefetch_anchor"] == anchor:
+                return
+            state["prefetch_anchor"] = anchor
+
+            # A different Z range makes older prefetched projections inexact.
+            for key in list(prefetched_projections):
+                if key[1:] != (zlo, zhi):
+                    prefetch_cache_bytes -= prefetched_projections.pop(key).nbytes
+
+            direction = 1 if int(state["fov_direction"]) >= 0 else -1
+            targets = []
+            for distance in range(1, 4):
+                candidate = int(p) + direction * distance
+                if not (0 <= candidate < nP):
+                    break
+                key = (candidate, zlo, zhi)
+                if key not in prefetched_projections:
+                    targets.append((candidate, zlo, zhi))
+            prefetch_controller.schedule(targets)
+
         def _ensure_roi_layer(
             image_shape_yx: tuple[int, int],
             default_height_um: float = 1000.0,
@@ -712,6 +920,10 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
             roi_layer.editable = True
             roi_layer.mode = "select"
 
+            @roi_layer.bind_key("S", overwrite=True)
+            def _shortcut_set_size_while_roi_active(_layer):
+                _apply_roi_size_from_controls()
+
         def _roi_bbox_from_layer() -> tuple[int, int, int, int] | None:
             nonlocal roi_layer
             if roi_layer is None or roi_layer not in viewer.layers:
@@ -728,12 +940,25 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
             return (y0, y1, x0, x1)
 
         def refresh():
+            nonlocal prefetch_cache_bytes
             preview_controller.invalidate()
             p, z0, z1 = int(state["p"]), int(state["z0"]), int(state["z1"])
 
             projection_key = (p, min(z0, z1), max(z0, z1))
             if state["projection_key"] != projection_key or state["full_proj_cyx"] is None:
-                state["full_proj_cyx"] = _project_cached_z_range(p, z0, z1)
+                prefetched = prefetched_projections.pop(projection_key, None)
+                if prefetched is not None:
+                    prefetch_cache_bytes -= prefetched.nbytes
+                    state["full_proj_cyx"] = prefetched
+                    load_progress_bar.setRange(0, 1)
+                    load_progress_bar.setValue(1)
+                    load_progress_label.setText(
+                        f"FOV P{p:03d} ready from background cache | Z {projection_key[1]}–{projection_key[2]}"
+                    )
+                    _repaint_load_progress()
+                    print(f"[Prefetch] Using cached projection for P={p}")
+                else:
+                    state["full_proj_cyx"] = _project_cached_z_range(p, z0, z1)
                 state["projection_key"] = projection_key
             else:
                 print(f"[Cache] Reusing projection P={p}, Z={projection_key[1]}:{projection_key[2]}")
@@ -743,21 +968,30 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
 
             active = viewer.layers.selection.active
             active_name = active.name if active else None
-            name_to_layer = {ly.name: ly for ly in viewer.layers}
+            channel_by_di = {}
+            for layer in _get_channel_layers(include_hidden=True):
+                display_index = _layer_display_index(layer)
+                if display_index is not None and display_index not in channel_by_di:
+                    channel_by_di[display_index] = layer
 
-            expected = []
             for di, ci in enumerate(ch_infos_disp):
                 lname = f"CH{di}_{ci.name}"
-                expected.append(lname)
-
                 raw_c = ci.index
                 if raw_c >= proj_cyx.shape[0]:
                     continue
 
-                if lname in name_to_layer:
-                    name_to_layer[lname].data = proj_cyx[raw_c]
+                if di in channel_by_di:
+                    layer = channel_by_di[di]
+                    layer.data = proj_cyx[raw_c]
+                    layer_metadata = dict(getattr(layer, "metadata", {}) or {})
+                    layer_metadata.update(
+                        nd2_channel_layer=True,
+                        nd2_display_index=di,
+                        nd2_raw_channel_index=raw_c,
+                    )
+                    layer.metadata = layer_metadata
                     if layer_scale is not None:
-                        name_to_layer[lname].scale = layer_scale
+                        layer.scale = layer_scale
                 else:
                     kwargs = {}
                     if layer_scale is not None:
@@ -770,13 +1004,23 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
                         **kwargs,
                     )
                     layer.colormap = DEFAULT_COLORMAPS.get(di, "gray")
+                    layer_metadata = dict(getattr(layer, "metadata", {}) or {})
+                    layer_metadata.update(
+                        nd2_channel_layer=True,
+                        nd2_display_index=di,
+                        nd2_raw_channel_index=raw_c,
+                    )
+                    layer.metadata = layer_metadata
                     contrast_limits = DEFAULT_CONTRAST_LIMITS.get(di)
                     if contrast_limits is not None:
                         layer.contrast_limits = contrast_limits
 
-            # Remove old CH layers that no longer exist
+            # Remove tagged channel layers whose source channel no longer exists.
             for ly in list(viewer.layers):
-                if ly.name.startswith("CH") and ly.name not in expected:
+                if (
+                    (getattr(ly, "metadata", {}) or {}).get("nd2_channel_layer", False)
+                    and _layer_display_index(ly) not in range(len(ch_infos_disp))
+                ):
                     viewer.layers.remove(ly)
 
             if active_name:
@@ -789,6 +1033,7 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
 
             # ensure ROI exists (only after images exist)
             _ensure_roi_layer((proj_cyx.shape[1], proj_cyx.shape[2]))
+            _schedule_neighbor_prefetch(p, z0, z1)
 
         # ---------------- Widgets ----------------
         @magicgui(
@@ -801,6 +1046,7 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
         def controls(p=0, z0=0, z1=max(0, nZ - 1)):
             # If POV changed, clear crop so each POV starts full-size
             if int(p) != int(state["p"]):
+                state["fov_direction"] = 1 if int(p) > int(state["p"]) else -1
                 if state["crop_bbox"] is not None:
                     print(f"[ROI] POV changed (P {state['p']} -> {p}) → clearing crop.")
                 state["crop_bbox"] = None
@@ -815,10 +1061,19 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
                     roi_layer = None
 
             state["p"], state["z0"], state["z1"] = p, z0, z1
-            refresh()
+            _refresh_foreground()
             _select_fov_item(int(p))
 
         fov_navigator = None
+
+        def _refresh_foreground():
+            if fov_navigator is not None:
+                fov_navigator.pause("foreground")
+            try:
+                refresh()
+            finally:
+                if fov_navigator is not None:
+                    fov_navigator.resume("foreground")
 
         def _select_fov_item(p: int):
             if fov_navigator is None:
@@ -829,6 +1084,7 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
             nonlocal roi_layer
             p = int(p)
             if p != int(state["p"]):
+                state["fov_direction"] = 1 if p > int(state["p"]) else -1
                 if state["crop_bbox"] is not None:
                     print(f"[ROI] FOV changed (P {state['p']} -> {p}) -> clearing crop.")
                 state["crop_bbox"] = None
@@ -844,7 +1100,7 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
                 controls.p.value = p
             except Exception:
                 pass
-            refresh()
+            _refresh_foreground()
             _select_fov_item(p)
 
         if nP > 1:
@@ -857,8 +1113,11 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
                 default_colormaps=DEFAULT_COLORMAPS,
                 pixel_um=pixel_um,
                 on_fov_selected=_go_to_fov,
+                preload_all_thumbnails=True,
+                preload_all_threshold=20,
             )
             viewer.window.add_dock_widget(fov_navigator, area="top", name="FOV Navigator")
+            save_queue.activity_changed.connect(fov_navigator.set_paused)
             _select_fov_item(0)
 
         @magicgui(call_button="Save TIFF")
@@ -870,19 +1129,23 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
             ordered = []
             ordered_names = []
             ordered_colors = []
-            name_to_layer = {ly.name: ly for ly in viewer.layers}
+            layers_by_di = {
+                _layer_display_index(layer): layer
+                for layer in _get_channel_layers(include_hidden=True)
+                if _layer_display_index(layer) is not None
+            }
             for di, ci in enumerate(ch_infos_disp):
                 if ci.index < proj.shape[0]:
                     ordered.append(proj[ci.index])
                     ordered_names.append(ci.name)
-                    layer = name_to_layer.get(f"CH{di}_{ci.name}")
+                    layer = layers_by_di.get(di)
                     ordered_colors.append(_layer_ome_color(layer) if layer is not None else None)
 
             if not ordered:
                 return
 
             name = default_name(nd2_path.stem, int(state["p"]), int(state["z0"]), int(state["z1"]))
-            destination = _reserve_output_path(out_dir / name)
+            destination = _reserve_output_path(output_state["dir"] / name)
             planes = tuple(ordered)
             names = tuple(ordered_names)
             colors = tuple(ordered_colors)
@@ -909,7 +1172,7 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
             if state["last_proj_cyx"] is None:
                 refresh()
 
-            jpeg_dir = out_dir / "jpeg_channels"
+            jpeg_dir = output_state["dir"] / "jpeg_channels"
 
             # --- include POV + Z range in filenames to avoid overwriting ---
             p = int(state["p"])
@@ -987,6 +1250,8 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
             if not snapshots:
                 return
             settings = dict(sb)
+            settings["show_marker_names"] = montage_labels_checkbox.isChecked()
+            settings["marker_font_size"] = marker_font_size_spinbox.value()
             preview_controller.request(
                 lambda source=snapshots, scale_settings=settings: _render_montage_snapshot(
                     source, scale_settings
@@ -1009,8 +1274,10 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
             has_merged = any(not snapshot["brightfield"] for snapshot in snapshots)
             r, c = 1, len(snapshots) + int(has_merged)
             settings = dict(sb)
+            settings["show_marker_names"] = montage_labels_checkbox.isChecked()
+            settings["marker_font_size"] = marker_font_size_spinbox.value()
 
-            out = out_dir / "jpeg_montage"
+            out = output_state["dir"] / "jpeg_montage"
             fname = f"{nd2_path.stem}_P{p:03d}_Z{min(z0, z1):03d}-{max(z0, z1):03d}_MONTAGE_{r}x{c}.jpg"
             destination = _reserve_output_path(out / fname)
 
@@ -1071,6 +1338,12 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
                 roi_layer.mode = "select"
             viewer.status = f"ROI resized to ~{height_um} x {width_um} um"
 
+        def _apply_roi_size_from_controls() -> None:
+            roi_size(
+                height_um=int(roi_size.height_um.value),
+                width_um=int(roi_size.width_um.value),
+            )
+
         @magicgui(call_button="Crop to ROI")
         def crop_to_roi():
             bbox = _roi_bbox_from_layer()
@@ -1125,6 +1398,41 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
                 roi_layer = None
             refresh()
 
+        @magicgui(call_button="Choose output destination")
+        def choose_output_folder():
+            selected = QtWidgets.QFileDialog.getExistingDirectory(
+                viewer.window._qt_window,
+                "Choose output destination",
+                str(output_state["base_dir"]),
+            )
+            if not selected:
+                return
+            base_destination = Path(selected)
+            destination = base_destination / f"{nd2_path.stem}_maxproj"
+            destination.mkdir(parents=True, exist_ok=True)
+            output_state["base_dir"] = base_destination
+            output_state["dir"] = destination
+            output_path_label.setText(f"Output: {destination}")
+            output_path_label.setToolTip(str(destination))
+            viewer.status = f"Output folder: {destination}"
+
+        output_path_label = QtWidgets.QLabel(f"Output: {output_state['dir']}")
+        output_path_label.setWordWrap(True)
+        output_path_label.setToolTip(str(output_state["dir"]))
+        montage_labels_checkbox = QtWidgets.QCheckBox("Marker names")
+        montage_labels_checkbox.setChecked(True)
+        montage_labels_checkbox.setToolTip(
+            "Show each channel layer name above its montage tile; the merged tile is labeled Merge."
+        )
+        marker_font_size_spinbox = QtWidgets.QSpinBox()
+        marker_font_size_spinbox.setRange(16, 200)
+        marker_font_size_spinbox.setValue(64)
+        marker_font_size_spinbox.setPrefix("Font ")
+        marker_font_size_spinbox.setSuffix(" px")
+        marker_font_size_spinbox.setToolTip(
+            "Tahoma Bold marker-label size. Long names shrink only when necessary to fit."
+        )
+
         def _set_button_tooltip(widget, tooltip: str) -> None:
             widget.native.setToolTip(tooltip)
             try:
@@ -1138,7 +1446,7 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
             layout.setContentsMargins(4, 4, 4, 4)
             layout.setSpacing(8)
             for widget in widgets:
-                layout.addWidget(widget.native)
+                layout.addWidget(getattr(widget, "native", widget))
             return container
 
         _set_button_tooltip(
@@ -1151,22 +1459,69 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
         )
         _set_button_tooltip(
             preview_montage,
-            "Preview visible channels plus a merged fluorescence tile without brightfield.",
+            "Preview visible channels plus a merged fluorescence tile without brightfield. Shortcut: M.",
         )
         _set_button_tooltip(
             save_montage,
-            "Save visible channels plus a merged fluorescence tile without brightfield as one JPEG.",
+            "Save visible channels plus a merged fluorescence tile without brightfield as one JPEG. Shortcut: Shift+M.",
         )
-        _set_button_tooltip(roi_size, "Center the yellow ROI using the requested width and height.")
-        _set_button_tooltip(crop_to_roi, "Crop the working view to the selected yellow ROI.")
+        _set_button_tooltip(
+            roi_size,
+            "Center the yellow ROI using the requested width and height. Shortcut: S.",
+        )
+        _set_button_tooltip(
+            crop_to_roi,
+            "Crop the working view to the selected yellow ROI. Shortcut: C.",
+        )
+        _set_button_tooltip(
+            choose_output_folder,
+            "Choose the parent destination where the <ND2 name>_maxproj output folder will be created.",
+        )
 
+        output_row = _control_row(choose_output_folder, output_path_label)
         save_row = _control_row(save_tiff, save_jpeg_channels)
-        montage_row = _control_row(preview_montage, save_montage)
+        montage_row = _control_row(
+            preview_montage,
+            save_montage,
+            montage_labels_checkbox,
+            marker_font_size_spinbox,
+        )
         roi_row = _control_row(roi_size, crop_to_roi)
+
+        @viewer.bind_key("M", overwrite=True)
+        def _shortcut_preview_montage(_viewer):
+            preview_montage()
+
+        @viewer.bind_key("Shift-M", overwrite=True)
+        def _shortcut_save_montage(_viewer):
+            save_montage()
+
+        @viewer.bind_key("N", overwrite=True)
+        def _shortcut_next_fov(_viewer):
+            next_p = int(state["p"]) + 1
+            if next_p >= nP:
+                viewer.status = "Already at the last FOV"
+                return
+            _go_to_fov(next_p)
+
+        @viewer.bind_key("S", overwrite=True)
+        def _shortcut_set_roi_size(_viewer):
+            _apply_roi_size_from_controls()
+
+        @viewer.bind_key("C", overwrite=True)
+        def _shortcut_crop_to_roi(_viewer):
+            crop_to_roi()
+
+        if fov_navigator is not None:
+            fov_navigator.setToolTip(
+                "Select an FOV from the thumbnail strip. Shortcut N moves to the next FOV."
+            )
 
         # Dock widgets
         viewer.window.add_dock_widget(controls, area="right")
         viewer.window.add_dock_widget(load_progress_widget, area="right", name="FOV Load Progress")
+        viewer.window.add_dock_widget(prefetch_status, area="right", name="FOV Prefetch Status")
+        viewer.window.add_dock_widget(output_row, area="right", name="Output Folder")
         viewer.window.add_dock_widget(save_row, area="right", name="Image Saves")
         viewer.window.add_dock_widget(montage_row, area="right", name="Montage")
         viewer.window.add_dock_widget(preview_status, area="right", name="Montage Preview Status")
@@ -1216,7 +1571,18 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
                 viewer.scale_bar.color = color
                 viewer.scale_bar.length = float(length_um)
 
-            viewer.window.add_dock_widget(scale_bar, area="right")
+            scale_bar_scroll = QtWidgets.QScrollArea()
+            scale_bar_scroll.setWidgetResizable(True)
+            scale_bar_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+            scale_bar_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+            scale_bar_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+            scale_bar.native.setMinimumHeight(scale_bar.native.sizeHint().height())
+            scale_bar_scroll.setWidget(scale_bar.native)
+            viewer.window.add_dock_widget(
+                scale_bar_scroll,
+                area="right",
+                name="Scale Bar",
+            )
 
             print("[Scale] Auto-enabling scale bar overlay (default 50 µm).")
             viewer.scale_bar.visible = True

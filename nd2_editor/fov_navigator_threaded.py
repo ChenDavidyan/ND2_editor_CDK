@@ -230,6 +230,8 @@ class FOVNavigator(QtWidgets.QListWidget):
         pixel_um: float | None,
         on_fov_selected: Callable[[int], None],
         icon_size: int = 160,
+        preload_all_thumbnails: bool = False,
+        preload_all_threshold: int = 20,
         parent=None,
     ):
         super().__init__(parent)
@@ -237,8 +239,12 @@ class FOVNavigator(QtWidgets.QListWidget):
         self._icon_size = int(icon_size)
         self._cache: dict[int, QtGui.QIcon] = {}
         self._queue: list[int] = []
+        self._inflight_p: int | None = None
         self._processing = False
+        self._pause_reasons: set[str] = set()
         self._shutting_down = False
+        self._preload_all_thumbnails = bool(preload_all_thumbnails)
+        self._preload_all_threshold = max(1, int(preload_all_threshold))
 
         self._worker_thread = QtCore.QThread(self)
         self._worker = _ThumbnailWorker(
@@ -285,7 +291,21 @@ class FOVNavigator(QtWidgets.QListWidget):
         self.itemClicked.connect(self._handle_item_clicked)
         self.verticalScrollBar().valueChanged.connect(lambda _value: QtCore.QTimer.singleShot(1, self.queue_visible_thumbnails))
         self.horizontalScrollBar().valueChanged.connect(lambda _value: QtCore.QTimer.singleShot(1, self.queue_visible_thumbnails))
-        QtCore.QTimer.singleShot(100, self.queue_visible_thumbnails)
+        QtCore.QTimer.singleShot(100, self._queue_initial_thumbnails)
+
+    def _queue_initial_thumbnails(self) -> None:
+        self.queue_visible_thumbnails()
+        if not self._preload_all_thumbnails:
+            return
+        if self.count() <= self._preload_all_threshold:
+            self.queue_all_thumbnails()
+        else:
+            # Give the visible thumbnails and current view time to start first.
+            QtCore.QTimer.singleShot(750, self.queue_all_thumbnails)
+
+    def queue_all_thumbnails(self) -> None:
+        for p in range(self.count()):
+            self.queue_thumbnail(p)
 
     def select_fov(self, p: int) -> None:
         p = int(p)
@@ -299,7 +319,12 @@ class FOVNavigator(QtWidgets.QListWidget):
 
     def queue_thumbnail(self, p: int, priority: bool = False) -> None:
         p = int(p)
-        if p in self._cache or p in self._queue or not (0 <= p < self.count()):
+        if p in self._cache or p == self._inflight_p or not (0 <= p < self.count()):
+            return
+        if p in self._queue:
+            if priority:
+                self._queue.remove(p)
+                self._queue.insert(0, p)
             return
         if priority:
             self._queue.insert(0, p)
@@ -314,13 +339,13 @@ class FOVNavigator(QtWidgets.QListWidget):
         for row in range(self.count()):
             item = self.item(row)
             if item is not None and self.visualItemRect(item).intersects(viewport_rect):
-                self.queue_thumbnail(row)
+                self.queue_thumbnail(row, priority=True)
         current = self.currentRow()
         if current >= 0:
             self.queue_thumbnail(current, priority=True)
 
     def _process_next_thumbnail(self) -> None:
-        if self._shutting_down:
+        if self._shutting_down or self._pause_reasons:
             return
         if not self._queue:
             self._processing = False
@@ -330,10 +355,30 @@ class FOVNavigator(QtWidgets.QListWidget):
         if p in self._cache:
             QtCore.QTimer.singleShot(1, self._process_next_thumbnail)
             return
+        self._inflight_p = p
         self.request_thumbnail.emit(p)
+
+    @QtCore.Slot(bool)
+    def set_paused(self, paused: bool) -> None:
+        self._set_pause_reason("external", bool(paused))
+
+    def pause(self, reason: str) -> None:
+        self._set_pause_reason(str(reason), True)
+
+    def resume(self, reason: str) -> None:
+        self._set_pause_reason(str(reason), False)
+
+    def _set_pause_reason(self, reason: str, paused: bool) -> None:
+        if paused:
+            self._pause_reasons.add(reason)
+        else:
+            self._pause_reasons.discard(reason)
+        if not self._pause_reasons and self._processing:
+            QtCore.QTimer.singleShot(1, self._process_next_thumbnail)
 
     @QtCore.Slot(int, object)
     def _thumbnail_completed(self, p: int, rgb_u8: np.ndarray) -> None:
+        self._inflight_p = None
         if self._shutting_down:
             return
         item = self.item(int(p))
@@ -346,6 +391,7 @@ class FOVNavigator(QtWidgets.QListWidget):
 
     @QtCore.Slot(int, str)
     def _thumbnail_failed(self, p: int, message: str) -> None:
+        self._inflight_p = None
         if self._shutting_down:
             return
         item = self.item(int(p))
