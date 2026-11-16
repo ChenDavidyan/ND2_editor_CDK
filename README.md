@@ -106,6 +106,16 @@ This version keeps the original orthogonal viewer unchanged while adding:
 
 Orthogonal volumes can be large, so the app caches one complete FOV at a time instead of preloading several neighboring 3D volumes. Closing Napari shuts down the loading, thumbnail, and saving workers cleanly.
 
+For interactive projection boundaries and batch slicing, use:
+
+```powershell
+python run_orthogonal_view_faster_interactive.py C:\path\to\image.nd2
+```
+
+This version adds draggable XY Z-range boundaries, editable crosshair coordinates, cached dependency-aware XY/XZ/YZ updates, individual-view export, and background XY/XZ/YZ batch exports with preview bands and CSV indexes.
+
+The main `run_app_faster_threaded_savequeue.py` viewer also includes a single scrollable tools sidebar, an editable Napari `ANNOTATIONS` Shapes layer with optional solid or dashed JPEG rendering, and an in-app **Load new ND2 file** action. Loading another file preserves channel names, contrast limits, colormaps, visibility, opacity, blending, and display/export preferences while clearing the previous file's image caches and workers.
+
 ## Other launchers
 
 - `run_app.py`: original viewer
@@ -113,6 +123,7 @@ Orthogonal volumes can be large, so the app caches one complete FOV at a time in
 - `run_app_faster_threaded.py`: caching plus background FOV thumbnails
 - `run_orthogonal_view.py`: original orthogonal-view workflow
 - `run_orthogonal_view_faster.py`: cached, threaded orthogonal-view workflow
+- `run_orthogonal_view_faster_interactive.py`: interactive boundaries and batch orthogonal exports
 - `run_segmentation.py`: segmentation workflow
 
 ## Output behavior

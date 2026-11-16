@@ -640,6 +640,23 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
 
             return np.asarray(img, dtype=np.uint8)
 
+        def _sync_crosshair_position(event=None) -> None:
+            if crosshair_point_layer is None or len(crosshair_point_layer.data) == 0:
+                return
+            layout = _panel_layout()
+            y_offset, x_offset = _crop_offsets()
+            point_y, point_x = np.asarray(crosshair_point_layer.data[0], dtype=float)
+            for widget, coordinate, origin, offset, size in (
+                (crosshair_slabs.x_position, point_x, layout["xy_x"], x_offset, layout["xy_w"]),
+                (crosshair_slabs.y_position, point_y, layout["xy_y"], y_offset, layout["xy_h"]),
+            ):
+                lower, upper = int(offset), int(offset + size - 1)
+                # Expand first so switching between disjoint crops remains valid.
+                widget.min = min(widget.min, lower)
+                widget.max = max(widget.max, upper)
+                widget.value = lower + int(round(max(0.0, min(coordinate - origin, size - 1.0))))
+                widget.min, widget.max = lower, upper
+
         def _update_crosshair_overlay() -> None:
             nonlocal slab_layer, crosshair_layer, crosshair_point_layer
             slabs = _xy_slab_rectangles()
@@ -680,8 +697,10 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
                     face_color="yellow",
                 )
                 crosshair_point_layer.mode = "select"
+                crosshair_point_layer.events.data.connect(_sync_crosshair_position)
             else:
                 crosshair_point_layer.data = point
+            _sync_crosshair_position()
 
         def refresh():
             views = _make_views()
@@ -787,6 +806,8 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
 
         @magicgui(
             call_button="Apply crosshair slabs",
+            x_position={"label": "Crosshair X (px)", "min": 0, "max": max(0, nX - 1)},
+            y_position={"label": "Crosshair Y (px)", "min": 0, "max": max(0, nY - 1)},
             z_center={"label": "Z center", "min": 0, "max": max(0, nZ - 1)},
             z_thickness={"label": "Z thickness (slices)", "min": 1, "max": max(1, nZ), "step": 1},
             y_thickness={"label": y_thickness_label, "min": 1, "max": y_thickness_max, "step": 1},
@@ -794,22 +815,18 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
             image_angle={"label": "Image rotation (deg)", "min": -180, "max": 180, "step": 1},
         )
         def crosshair_slabs(
+            x_position: int = max(0, nX // 2),
+            y_position: int = max(0, nY // 2),
             z_center: int = max(0, nZ // 2),
             z_thickness: int = max(1, nZ),
             y_thickness: int = y_thickness_default,
             x_thickness: int = x_thickness_default,
             image_angle: int = 0,
         ):
-            nonlocal crosshair_point_layer
+            layout = _panel_layout()
             y_offset, x_offset = _crop_offsets()
-
-            if crosshair_point_layer is not None and crosshair_point_layer in viewer.layers and len(crosshair_point_layer.data) > 0:
-                layout = _panel_layout()
-                point_y, point_x = np.asarray(crosshair_point_layer.data[0], dtype=float)
-                local_y = point_y - layout["xy_y"]
-                local_x = point_x - layout["xy_x"]
-                state["cross_y"] = y_offset + int(round(max(0.0, min(local_y, layout["xy_h"] - 1.0))))
-                state["cross_x"] = x_offset + int(round(max(0.0, min(local_x, layout["xy_w"] - 1.0))))
+            state["cross_x"] = max(x_offset, min(int(x_position), x_offset + int(layout["xy_w"]) - 1))
+            state["cross_y"] = max(y_offset, min(int(y_position), y_offset + int(layout["xy_h"]) - 1))
 
             def centered_range(center: int, thickness: int, max_size: int) -> tuple[int, int]:
                 thickness = max(1, int(thickness))

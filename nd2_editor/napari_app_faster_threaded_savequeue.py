@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from collections import OrderedDict
 import hashlib
+import json
 import os
 from pathlib import Path
 import math
+import subprocess
+import sys
 
 import nd2
 import napari
@@ -224,12 +227,31 @@ def _draw_scale_bar_on_rgb(
     return np.array(img, dtype=np.uint8)
 
 
-def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] | None = None):
+def launch(
+    nd2_path: str,
+    out_dir: str | None = None,
+    channel_names: list[str] | None = None,
+    initial_preferences: dict | None = None,
+):
+    if initial_preferences is None:
+        encoded_preferences = os.environ.pop("ND2_EDITOR_PREFERENCES", "")
+        if encoded_preferences:
+            try:
+                initial_preferences = json.loads(encoded_preferences)
+            except Exception as exc:
+                print(f"[Preferences] Could not restore previous viewer settings: {exc}")
+    initial_preferences = dict(initial_preferences or {})
     nd2_path = Path(nd2_path)
     output_base_dir = Path(out_dir) if out_dir else nd2_path.parent
     output_dir = output_base_dir / f"{nd2_path.stem}_maxproj"
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_state = {"base_dir": output_base_dir, "dir": output_dir}
+    output_state = {
+        "base_dir": output_base_dir,
+        "dir": output_dir,
+        "custom_destination": bool(
+            initial_preferences.get("custom_output_destination", out_dir is not None)
+        ),
+    }
 
     f = nd2.ND2File(nd2_path)
     try:
@@ -245,6 +267,7 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
 
         ch_infos_raw = get_channel_info(f, nC_fallback=nC)
         ch_infos_disp = order_channels_for_display(ch_infos_raw)
+        channel_preferences = tuple(initial_preferences.get("channels", ()))
 
         # Optional override: if you pass channel_names, apply by RAW index
         if channel_names is not None and len(channel_names) == nC:
@@ -258,6 +281,22 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
                     is_brightfield=ci.is_brightfield,
                 )
                 for ci in ch_infos_disp
+            ]
+
+        if channel_preferences:
+            ch_infos_disp = [
+                type(ci)(
+                    index=ci.index,
+                    name=(
+                        str(channel_preferences[di].get("name", ci.name))
+                        if di < len(channel_preferences)
+                        else ci.name
+                    ),
+                    excitation_nm=ci.excitation_nm,
+                    emission_nm=ci.emission_nm,
+                    is_brightfield=ci.is_brightfield,
+                )
+                for di, ci in enumerate(ch_infos_disp)
             ]
 
         print("Channels (raw ND2 order):")
@@ -422,6 +461,29 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
             digest = hashlib.sha1(original_name.encode("utf-8")).hexdigest()[:8]
             available = 230 - len(str(path.parent.absolute())) - len(compound_suffix) - len(digest) - 2
             if available < 8:
+                # Preserve the normal <ND2>_maxproj layout whenever possible.
+                # Only fall back after the existing compaction logic would have
+                # raised because the parent path itself is too long.
+                try:
+                    relative_parent = path.parent.relative_to(output_state["dir"])
+                except ValueError:
+                    relative_parent = Path()
+                compact_parent_names = {
+                    "jpeg_channels": "J",
+                    "jpeg_montage": "M",
+                }
+                fallback_parent = output_state["base_dir"]
+                if relative_parent.parts:
+                    fallback_parent /= compact_parent_names.get(
+                        relative_parent.parts[0], relative_parent.parts[0]
+                    )
+                fallback_path = fallback_parent / original_name
+                if fallback_path != path:
+                    print(
+                        "[Output] Parent path is too deep; using compact fallback: "
+                        f"{fallback_path}"
+                    )
+                    return _path_length_safe_output(fallback_path)
                 raise OSError(
                     "The selected output destination is too deeply nested for Windows. "
                     "Choose a shorter parent destination."
@@ -460,6 +522,10 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
             "font_size": 32,
             "bar_height": 12,
         }
+        saved_scale_bar = initial_preferences.get("scale_bar", {})
+        for key in sb:
+            if key in saved_scale_bar:
+                sb[key] = saved_scale_bar[key]
 
         # cropping state: applied AFTER projection
         state = {
@@ -519,6 +585,40 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
 
         # ROI shapes layer handle
         roi_layer = None
+        annotation_layer = None
+
+        def _ensure_annotation_layer() -> None:
+            nonlocal annotation_layer
+            if annotation_layer is not None and annotation_layer in viewer.layers:
+                return
+            kwargs = {}
+            if layer_scale is not None:
+                kwargs["scale"] = layer_scale
+            annotation_layer = viewer.add_shapes(
+                name="ANNOTATIONS",
+                edge_width=4,
+                edge_color="yellow",
+                face_color=[1, 1, 0, 0],
+                **kwargs,
+            )
+            annotation_layer.mode = "select"
+
+        def _capture_annotation_snapshot(*, dashed: bool = False) -> dict | None:
+            if (
+                annotation_layer is None
+                or annotation_layer not in viewer.layers
+                or len(annotation_layer.data) == 0
+                or not annotation_layer.visible
+            ):
+                return None
+            return {
+                "data": tuple(np.asarray(points, dtype=float).copy() for points in annotation_layer.data),
+                "shape_types": tuple(str(value) for value in annotation_layer.shape_type),
+                "edge_colors": np.asarray(annotation_layer.edge_color, dtype=float).copy(),
+                "face_colors": np.asarray(annotation_layer.face_color, dtype=float).copy(),
+                "edge_widths": np.atleast_1d(np.asarray(annotation_layer.edge_width, dtype=float)).copy(),
+                "dashed": bool(dashed),
+            }
 
         def _get_channel_layers(include_hidden: bool = True):
             layers = [
@@ -660,6 +760,125 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
             rgb = lut[indices] * snapshot["opacity"]
             return (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
 
+        def _burn_annotation_snapshot(rgb: np.ndarray, annotation: dict | None) -> np.ndarray:
+            if annotation is None or not annotation.get("data"):
+                return rgb
+            image = Image.fromarray(rgb, mode="RGB").convert("RGBA")
+            overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+            draw = ImageDraw.Draw(overlay)
+            edge_colors = annotation["edge_colors"]
+            face_colors = annotation["face_colors"]
+            edge_widths = annotation["edge_widths"]
+
+            def _rgba(values) -> tuple[int, int, int, int]:
+                values = np.clip(np.asarray(values, dtype=float), 0.0, 1.0)
+                if values.size < 4:
+                    values = np.append(values[:3], 1.0)
+                return tuple(int(round(value * 255)) for value in values[:4])
+
+            def _draw_dashed_polyline(
+                coordinates: list[tuple[int, int]],
+                *,
+                fill: tuple[int, int, int, int],
+                width: int,
+                closed: bool = False,
+                dash_length: float = 14.0,
+                gap_length: float = 9.0,
+            ) -> None:
+                if len(coordinates) < 2:
+                    return
+                points = list(coordinates)
+                if closed:
+                    points.append(points[0])
+                segments = []
+                total_length = 0.0
+                for start, end in zip(points[:-1], points[1:]):
+                    length = float(np.hypot(end[0] - start[0], end[1] - start[1]))
+                    if length > 0:
+                        segments.append((total_length, total_length + length, start, end))
+                        total_length += length
+
+                dash_start = 0.0
+                while dash_start < total_length:
+                    dash_end = min(total_length, dash_start + dash_length)
+                    for segment_start, segment_end, start, end in segments:
+                        overlap_start = max(dash_start, segment_start)
+                        overlap_end = min(dash_end, segment_end)
+                        if overlap_end <= overlap_start:
+                            continue
+                        length = segment_end - segment_start
+                        a = (overlap_start - segment_start) / length
+                        b = (overlap_end - segment_start) / length
+                        x0, y0 = start
+                        x1, y1 = end
+                        draw.line(
+                            [
+                                (int(round(x0 + (x1 - x0) * a)), int(round(y0 + (y1 - y0) * a))),
+                                (int(round(x0 + (x1 - x0) * b)), int(round(y0 + (y1 - y0) * b))),
+                            ],
+                            fill=fill,
+                            width=width,
+                        )
+                    dash_start += dash_length + gap_length
+
+            for index, (points, shape_type) in enumerate(
+                zip(annotation["data"], annotation["shape_types"])
+            ):
+                coordinates = [(int(round(x)), int(round(y))) for y, x in points]
+                if not coordinates:
+                    continue
+                edge = _rgba(edge_colors[min(index, len(edge_colors) - 1)])
+                face = _rgba(face_colors[min(index, len(face_colors) - 1)])
+                width = max(1, int(round(edge_widths[min(index, len(edge_widths) - 1)])))
+                if shape_type == "ellipse":
+                    xs = [point[0] for point in coordinates]
+                    ys = [point[1] for point in coordinates]
+                    bounds = (min(xs), min(ys), max(xs), max(ys))
+                    if face[3]:
+                        draw.ellipse(bounds, fill=face)
+                    if annotation.get("dashed", False):
+                        center_x = (bounds[0] + bounds[2]) / 2.0
+                        center_y = (bounds[1] + bounds[3]) / 2.0
+                        radius_x = (bounds[2] - bounds[0]) / 2.0
+                        radius_y = (bounds[3] - bounds[1]) / 2.0
+                        ellipse_points = [
+                            (
+                                int(round(center_x + radius_x * np.cos(angle))),
+                                int(round(center_y + radius_y * np.sin(angle))),
+                            )
+                            for angle in np.linspace(0.0, 2.0 * np.pi, 181)[:-1]
+                        ]
+                        _draw_dashed_polyline(
+                            ellipse_points,
+                            fill=edge,
+                            width=width,
+                            closed=True,
+                        )
+                    else:
+                        draw.ellipse(bounds, outline=edge, width=width)
+                elif shape_type in ("line", "path"):
+                    if annotation.get("dashed", False):
+                        _draw_dashed_polyline(coordinates, fill=edge, width=width)
+                    else:
+                        draw.line(coordinates, fill=edge, width=width, joint="curve")
+                else:
+                    draw.polygon(coordinates, fill=face if face[3] else None)
+                    if annotation.get("dashed", False):
+                        _draw_dashed_polyline(
+                            coordinates,
+                            fill=edge,
+                            width=width,
+                            closed=True,
+                        )
+                    else:
+                        draw.line(
+                            coordinates + [coordinates[0]],
+                            fill=edge,
+                            width=width,
+                            joint="curve",
+                        )
+            return np.asarray(Image.alpha_composite(image, overlay).convert("RGB"), dtype=np.uint8)
+
         def _burn_scalebar_snapshot(rgb: np.ndarray, settings: dict) -> np.ndarray:
             if pixel_um is None or not settings["show"]:
                 return rgb
@@ -690,7 +909,14 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
             )
 
         def _render_montage_snapshot(snapshots: tuple[dict, ...], settings: dict):
-            tiles = [_render_layer_snapshot(snapshot) for snapshot in snapshots]
+            raw_tiles = [_render_layer_snapshot(snapshot) for snapshot in snapshots]
+            tiles = [
+                _burn_annotation_snapshot(
+                    tile,
+                    settings.get("annotation"),
+                )
+                for tile in raw_tiles
+            ]
             show_labels = bool(settings.get("show_marker_names", True))
             labels = [snapshot["name"] for snapshot in snapshots] if show_labels else None
             label_colors = None
@@ -708,14 +934,19 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
                 ]
             fluorescence = [
                 tile
-                for snapshot, tile in zip(snapshots, tiles)
+                for snapshot, tile in zip(snapshots, raw_tiles)
                 if snapshot["visible"] and not snapshot["brightfield"]
             ]
             if fluorescence:
                 merged = fluorescence[0].astype(np.float32) / 255.0
                 for tile in fluorescence[1:]:
                     merged = np.clip(merged + tile.astype(np.float32) / 255.0, 0, 1)
-                tiles.append((merged * 255).astype(np.uint8))
+                tiles.append(
+                    _burn_annotation_snapshot(
+                        (merged * 255).astype(np.uint8),
+                        settings.get("annotation"),
+                    )
+                )
                 if labels is not None:
                     labels.append("Merge")
                     label_colors.append((255, 255, 255))
@@ -996,14 +1227,21 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
                     kwargs = {}
                     if layer_scale is not None:
                         kwargs["scale"] = layer_scale
+                    saved_channel = channel_preferences[di] if di < len(channel_preferences) else {}
                     layer = viewer.add_image(
                         proj_cyx[raw_c],
                         name=lname,
-                        blending="additive",
-                        visible=(ci.is_brightfield),
+                        blending=str(saved_channel.get("blending", "additive")),
+                        visible=bool(saved_channel.get("visible", ci.is_brightfield)),
+                        opacity=float(saved_channel.get("opacity", 1.0)),
                         **kwargs,
                     )
-                    layer.colormap = DEFAULT_COLORMAPS.get(di, "gray")
+                    try:
+                        layer.colormap = str(
+                            saved_channel.get("colormap", DEFAULT_COLORMAPS.get(di, "gray"))
+                        )
+                    except Exception:
+                        layer.colormap = DEFAULT_COLORMAPS.get(di, "gray")
                     layer_metadata = dict(getattr(layer, "metadata", {}) or {})
                     layer_metadata.update(
                         nd2_channel_layer=True,
@@ -1012,6 +1250,9 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
                     )
                     layer.metadata = layer_metadata
                     contrast_limits = DEFAULT_CONTRAST_LIMITS.get(di)
+                    saved_limits = saved_channel.get("contrast_limits")
+                    if saved_limits is not None and len(saved_limits) == 2:
+                        contrast_limits = (float(saved_limits[0]), float(saved_limits[1]))
                     if contrast_limits is not None:
                         layer.contrast_limits = contrast_limits
 
@@ -1197,6 +1438,11 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
                 return
 
             settings = dict(sb)
+            settings["annotation"] = (
+                _capture_annotation_snapshot(dashed=dashed_annotations_checkbox.isChecked())
+                if save_annotations_checkbox.isChecked()
+                else None
+            )
 
             def write_channel_jpegs(
                 progress,
@@ -1209,9 +1455,10 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
                 total = len(images) + (1 if merge_destination is not None else 0)
                 rendered_fluorescence = []
                 for index, (path, snapshot) in enumerate(images, start=1):
-                    rgb = _render_layer_snapshot(snapshot)
+                    raw_rgb = _render_layer_snapshot(snapshot)
                     if snapshot["visible"] and not snapshot["brightfield"]:
-                        rendered_fluorescence.append(rgb)
+                        rendered_fluorescence.append(raw_rgb)
+                    rgb = _burn_annotation_snapshot(raw_rgb, scale_settings.get("annotation"))
                     rgb = _burn_scalebar_snapshot(rgb, scale_settings)
                     _save_jpeg_300dpi(path, rgb, quality=95)
                     progress(index, total, f"{index}/{total}: {path.name}")
@@ -1220,7 +1467,11 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
                     merged = rendered_fluorescence[0].astype(np.float32) / 255.0
                     for rgb in rendered_fluorescence[1:]:
                         merged = np.clip(merged + rgb.astype(np.float32) / 255.0, 0, 1)
-                    merged = _burn_scalebar_snapshot((merged * 255).astype(np.uint8), scale_settings)
+                    merged = _burn_annotation_snapshot(
+                        (merged * 255).astype(np.uint8),
+                        scale_settings.get("annotation"),
+                    )
+                    merged = _burn_scalebar_snapshot(merged, scale_settings)
                     _save_jpeg_300dpi(merge_destination, merged, quality=95)
                     progress(total, total, f"{total}/{total}: {merge_destination.name}")
 
@@ -1250,6 +1501,11 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
             if not snapshots:
                 return
             settings = dict(sb)
+            settings["annotation"] = (
+                _capture_annotation_snapshot(dashed=dashed_annotations_checkbox.isChecked())
+                if save_annotations_checkbox.isChecked()
+                else None
+            )
             settings["show_marker_names"] = montage_labels_checkbox.isChecked()
             settings["marker_font_size"] = marker_font_size_spinbox.value()
             preview_controller.request(
@@ -1274,6 +1530,11 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
             has_merged = any(not snapshot["brightfield"] for snapshot in snapshots)
             r, c = 1, len(snapshots) + int(has_merged)
             settings = dict(sb)
+            settings["annotation"] = (
+                _capture_annotation_snapshot(dashed=dashed_annotations_checkbox.isChecked())
+                if save_annotations_checkbox.isChecked()
+                else None
+            )
             settings["show_marker_names"] = montage_labels_checkbox.isChecked()
             settings["marker_font_size"] = marker_font_size_spinbox.value()
 
@@ -1412,21 +1673,133 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
             destination.mkdir(parents=True, exist_ok=True)
             output_state["base_dir"] = base_destination
             output_state["dir"] = destination
+            output_state["custom_destination"] = True
             output_path_label.setText(f"Output: {destination}")
             output_path_label.setToolTip(str(destination))
             viewer.status = f"Output folder: {destination}"
 
+        @magicgui(call_button="Load new ND2 file")
+        def load_new_nd2():
+            nonlocal prefetch_cache_bytes
+            selected = QtWidgets.QFileDialog.getOpenFileName(
+                viewer.window._qt_window,
+                "Load a new ND2 file",
+                str(nd2_path.parent),
+                "Nikon ND2 files (*.nd2);;All files (*)",
+            )[0]
+            if not selected:
+                return
+            selected_path = Path(selected)
+            if selected_path.resolve() == nd2_path.resolve():
+                viewer.status = "That ND2 file is already open."
+                return
+
+            channels = []
+            layers_by_index = {
+                _layer_display_index(layer): layer
+                for layer in _get_channel_layers(include_hidden=True)
+                if _layer_display_index(layer) is not None
+            }
+            for di, ci in enumerate(ch_infos_disp):
+                layer = layers_by_index.get(di)
+                if layer is None:
+                    channels.append({"name": ci.name})
+                    continue
+                channels.append(
+                    {
+                        "name": str(layer.name),
+                        "contrast_limits": [float(value) for value in layer.contrast_limits],
+                        "colormap": str(getattr(layer.colormap, "name", "gray")),
+                        "opacity": float(layer.opacity),
+                        "visible": bool(layer.visible),
+                        "blending": str(getattr(layer.blending, "value", layer.blending)),
+                    }
+                )
+
+            preferences = {
+                "channels": channels,
+                "scale_bar": dict(sb),
+                "montage_labels": montage_labels_checkbox.isChecked(),
+                "marker_font_size": marker_font_size_spinbox.value(),
+                "save_annotations": save_annotations_checkbox.isChecked(),
+                "dashed_annotations": dashed_annotations_checkbox.isChecked(),
+                "custom_output_destination": bool(output_state["custom_destination"]),
+                "roi_height_um": int(roi_size.height_um.value),
+                "roi_width_um": int(roi_size.width_um.value),
+            }
+            environment = os.environ.copy()
+            environment["ND2_EDITOR_PREFERENCES"] = json.dumps(preferences)
+            launcher = Path(__file__).resolve().parent.parent / "run_app_faster_threaded_savequeue.py"
+            next_output_base = (
+                output_state["base_dir"]
+                if output_state["custom_destination"]
+                else selected_path.parent
+            )
+            command = [
+                sys.executable,
+                str(launcher),
+                str(selected_path),
+                "--out-dir",
+                str(next_output_base),
+            ]
+            try:
+                subprocess.Popen(command, cwd=str(launcher.parent), env=environment)
+            except Exception as exc:
+                viewer.status = f"Could not open the new ND2 file: {exc}"
+                print(f"[Load ND2] Failed to start new viewer: {exc}")
+                return
+
+            # Release all image data before this viewer closes. The new process
+            # receives preferences only, never cached arrays from the old file.
+            plane_cache.clear()
+            prefetched_projections.clear()
+            prefetch_cache_bytes = 0
+            state["last_proj_cyx"] = None
+            state["full_proj_cyx"] = None
+            state["projection_key"] = None
+            preview_controller.shutdown()
+            prefetch_controller.shutdown()
+            if fov_navigator is not None:
+                fov_navigator.shutdown()
+            save_queue.shutdown()
+            print(f"[Load ND2] Cleared caches and opening: {selected_path}")
+            QtCore.QTimer.singleShot(0, viewer.close)
+
         output_path_label = QtWidgets.QLabel(f"Output: {output_state['dir']}")
         output_path_label.setWordWrap(True)
         output_path_label.setToolTip(str(output_state["dir"]))
+        save_annotations_checkbox = QtWidgets.QCheckBox("Save annotations in JPEGs")
+        save_annotations_checkbox.setChecked(
+            bool(initial_preferences.get("save_annotations", True))
+        )
+        save_annotations_checkbox.setToolTip(
+            "When enabled, visible shapes from the ANNOTATIONS layer are drawn into channel and montage JPEGs."
+        )
+        dashed_annotations_checkbox = QtWidgets.QCheckBox("Render annotation outlines as dashed")
+        dashed_annotations_checkbox.setChecked(
+            bool(initial_preferences.get("dashed_annotations", False))
+        )
+        dashed_annotations_checkbox.setToolTip(
+            "Keep shapes solid and editable in Napari, but render every annotation outline as dashed in JPEG exports."
+        )
+
+        def _annotation_export_toggled(enabled: bool) -> None:
+            dashed_annotations_checkbox.setEnabled(bool(enabled))
+
+        save_annotations_checkbox.toggled.connect(_annotation_export_toggled)
+        _annotation_export_toggled(save_annotations_checkbox.isChecked())
         montage_labels_checkbox = QtWidgets.QCheckBox("Marker names")
-        montage_labels_checkbox.setChecked(True)
+        montage_labels_checkbox.setChecked(
+            bool(initial_preferences.get("montage_labels", True))
+        )
         montage_labels_checkbox.setToolTip(
             "Show each channel layer name above its montage tile; the merged tile is labeled Merge."
         )
         marker_font_size_spinbox = QtWidgets.QSpinBox()
         marker_font_size_spinbox.setRange(16, 200)
-        marker_font_size_spinbox.setValue(64)
+        marker_font_size_spinbox.setValue(
+            int(initial_preferences.get("marker_font_size", 64))
+        )
         marker_font_size_spinbox.setPrefix("Font ")
         marker_font_size_spinbox.setSuffix(" px")
         marker_font_size_spinbox.setToolTip(
@@ -1478,6 +1851,17 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
             "Choose the parent destination where the <ND2 name>_maxproj output folder will be created.",
         )
 
+        _set_button_tooltip(
+            load_new_nd2,
+            "Open another ND2 in a fresh viewer while preserving channel names, contrast, colormaps, and display preferences.",
+        )
+
+        if "roi_height_um" in initial_preferences:
+            roi_size.height_um.value = int(initial_preferences["roi_height_um"])
+        if "roi_width_um" in initial_preferences:
+            roi_size.width_um.value = int(initial_preferences["roi_width_um"])
+
+        load_file_row = _control_row(load_new_nd2)
         output_row = _control_row(choose_output_folder, output_path_label)
         save_row = _control_row(save_tiff, save_jpeg_channels)
         montage_row = _control_row(
@@ -1517,19 +1901,8 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
                 "Select an FOV from the thumbnail strip. Shortcut N moves to the next FOV."
             )
 
-        # Dock widgets
-        viewer.window.add_dock_widget(controls, area="right")
-        viewer.window.add_dock_widget(load_progress_widget, area="right", name="FOV Load Progress")
-        viewer.window.add_dock_widget(prefetch_status, area="right", name="FOV Prefetch Status")
-        viewer.window.add_dock_widget(output_row, area="right", name="Output Folder")
-        viewer.window.add_dock_widget(save_row, area="right", name="Image Saves")
-        viewer.window.add_dock_widget(montage_row, area="right", name="Montage")
-        viewer.window.add_dock_widget(preview_status, area="right", name="Montage Preview Status")
-        viewer.window.add_dock_widget(save_queue, area="right", name="Save Queue")
-        viewer.window.add_dock_widget(roi_row, area="right", name="ROI")
-        viewer.window.add_dock_widget(reset_crop, area="right")
-
         # Scale-bar widget (overlay + JPEG export settings). TIFF relies on pixel_um metadata.
+        scale_bar_widget = None
         if pixel_um is not None:
 
             @magicgui(
@@ -1571,28 +1944,91 @@ def launch(nd2_path: str, out_dir: str | None = None, channel_names: list[str] |
                 viewer.scale_bar.color = color
                 viewer.scale_bar.length = float(length_um)
 
-            scale_bar_scroll = QtWidgets.QScrollArea()
-            scale_bar_scroll.setWidgetResizable(True)
-            scale_bar_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-            scale_bar_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-            scale_bar_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+            scale_bar["show"].value = bool(sb["show"])
+            scale_bar["auto_size"].value = bool(sb["auto_size"])
+            scale_bar["length_um"].value = int(sb["length_um"])
+            scale_bar["position"].value = str(sb["position"])
+            scale_bar["color"].value = str(sb["color"])
+            scale_bar["font_size"].value = int(sb["font_size"])
+            scale_bar["bar_height"].value = int(sb["bar_height"])
             scale_bar.native.setMinimumHeight(scale_bar.native.sizeHint().height())
-            scale_bar_scroll.setWidget(scale_bar.native)
-            viewer.window.add_dock_widget(
-                scale_bar_scroll,
-                area="right",
-                name="Scale Bar",
-            )
+            scale_bar_widget = scale_bar.native
 
-            print("[Scale] Auto-enabling scale bar overlay (default 50 µm).")
-            viewer.scale_bar.visible = True
+            print("[Scale] Applying scale bar preferences.")
+            viewer.scale_bar.visible = bool(sb["show"])
             viewer.scale_bar.unit = "µm"
             viewer.scale_bar.position = sb["position"]
             viewer.scale_bar.color = sb["color"]
             viewer.scale_bar.length = float(sb["length_um"])
 
+        annotation_panel = QtWidgets.QWidget()
+        annotation_layout = QtWidgets.QVBoxLayout(annotation_panel)
+        annotation_layout.setContentsMargins(0, 0, 0, 0)
+        annotation_help = QtWidgets.QLabel(
+            "Select the ANNOTATIONS Shapes layer, then use Napari's Shapes toolbar to draw, edit, or delete shapes."
+        )
+        annotation_help.setWordWrap(True)
+        annotation_layout.addWidget(annotation_help)
+        annotation_layout.addWidget(save_annotations_checkbox)
+        annotation_layout.addWidget(dashed_annotations_checkbox)
+
+        tools_content = QtWidgets.QWidget()
+        tools_layout = QtWidgets.QVBoxLayout(tools_content)
+        tools_layout.setContentsMargins(6, 6, 6, 6)
+        tools_layout.setSpacing(8)
+
+        def _add_tool_section(title: str, widget) -> None:
+            group = QtWidgets.QGroupBox(title)
+            layout = QtWidgets.QVBoxLayout(group)
+            layout.setContentsMargins(6, 8, 6, 6)
+            layout.addWidget(getattr(widget, "native", widget))
+            tools_layout.addWidget(group)
+
+        _add_tool_section("Projection and FOV", controls)
+        _add_tool_section("Load another file", load_file_row)
+        _add_tool_section("FOV load progress", load_progress_widget)
+        _add_tool_section("FOV prefetch", prefetch_status)
+        _add_tool_section("Output folder", output_row)
+        _add_tool_section("Image saves", save_row)
+        _add_tool_section("Montage", montage_row)
+        _add_tool_section("Montage preview status", preview_status)
+        _add_tool_section("Save queue", save_queue)
+        _add_tool_section("ROI", roi_row)
+        _add_tool_section("Reset crop", reset_crop)
+        _add_tool_section("Annotation shapes", annotation_panel)
+        if scale_bar_widget is not None:
+            _add_tool_section("Scale bar", scale_bar_widget)
+        tools_layout.addStretch(1)
+
+        tools_scroll = QtWidgets.QScrollArea()
+        tools_scroll.setWidgetResizable(True)
+        tools_scroll.setWidget(tools_content)
+        tools_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        tools_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        tools_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        tools_scroll.setMinimumWidth(430)
+        viewer.window.add_dock_widget(
+            tools_scroll,
+            area="right",
+            name="ND2 Editor Tools",
+        )
+
         refresh()
+        _ensure_annotation_layer()
         napari.run()
 
     finally:
+        for worker_name in (
+            "fov_navigator",
+            "preview_controller",
+            "prefetch_controller",
+            "save_queue",
+        ):
+            worker = locals().get(worker_name)
+            if worker is None or not hasattr(worker, "shutdown"):
+                continue
+            try:
+                worker.shutdown()
+            except Exception as exc:
+                print(f"[Shutdown] {worker_name} cleanup failed: {exc}")
         f.close()
